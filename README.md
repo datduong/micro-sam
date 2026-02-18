@@ -3,6 +3,12 @@
 [![codecov](https://codecov.io/gh/computational-cell-analytics/micro-sam/graph/badge.svg?token=7ETPP5CABP)](https://codecov.io/gh/computational-cell-analytics/micro-sam)
 [![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.7919746.svg)](https://doi.org/10.5281/zenodo.7919746)
 
+# SSegment Anything for CALMs based on the original GitHub of Micro SAM (see below for their instructions). 
+
+We made the following changes for CALMs 
+- Change 1. 
+- Change 2.
+
 # Segment Anything for Microscopy
 
 <a href="https://github.com/computational-cell-analytics/micro-sam"><img src="https://github.com/computational-cell-analytics/micro-sam/blob/master/doc/logo/logo_and_text.png" width="300" align="right">
