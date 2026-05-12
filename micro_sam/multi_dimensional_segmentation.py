@@ -3,6 +3,7 @@
 
 import os
 import multiprocessing as mp
+import warnings
 from concurrent import futures
 from typing import Dict, List, Optional, Union, Tuple
 
@@ -30,6 +31,8 @@ try:
     from trackastra.tracking import graph_to_ctc, graph_to_napari_tracks
 except ImportError:
     Trackastra = None
+    graph_to_ctc = None
+    graph_to_napari_tracks = None
 
 
 from . import util
@@ -333,7 +336,7 @@ def merge_instance_segmentation_3d(
         verbose: Verbosity flag. By default, set to 'True'.
         pbar_init: Callback to initialize an external progress bar. Must accept number of steps and description.
             Can be used together with pbar_update to handle napari progress bar in other thread.
-            To enables using this function within a threadworker.
+            To enable using this function within a threadworker.
         pbar_update: Callback to update an external progress bar.
 
     Returns:
@@ -567,8 +570,19 @@ def _filter_lineages(lineages, tracking_result):
 def _tracking_impl(timeseries, segmentation, mode, min_time_extent, output_folder=None):
     device = "cuda" if torch.cuda.is_available() else "cpu"
     model = Trackastra.from_pretrained("general_2d", device=device)
-    lineage_graph, _ = model.track(timeseries, segmentation, mode=mode)
+    result = model.track(timeseries, segmentation, mode=mode)
+    try:
+        lineage_graph, _ = result
+    except ValueError:
+        lineage_graph = result
+
     track_data, parent_graph, _ = graph_to_napari_tracks(lineage_graph)
+    if track_data.size == 0:
+        warnings.warn("Tracking result is empty.")
+        tracking_result = np.zeros_like(segmentation)
+        lineages = []
+        return tracking_result, lineages
+
     node_to_track, lineages = _extract_tracks_and_lineages(segmentation, track_data, parent_graph)
     tracking_result = recolor_segmentation(segmentation, node_to_track)
 
@@ -582,7 +596,7 @@ def _tracking_impl(timeseries, segmentation, mode, min_time_extent, output_folde
         raise NotImplementedError
 
     # Filter out pruned lineages.
-    # Mmay either be missing due to track filtering or non-consectutive track numbering in trackastra.
+    # May either be missing due to track filtering or non-consecutive track numbering in trackastra.
     lineages = _filter_lineages(lineages, tracking_result)
 
     return tracking_result, lineages
@@ -621,6 +635,11 @@ def track_across_frames(
             with each dict encoding a lineage, where keys correspond to parent track ids.
             Each key either maps to a list with two child track ids (cell division) or to an empty list (no division).
     """
+    if Trackastra is None:
+        raise RuntimeError(
+            "Automatic tracking requires trackastra. You can install it via 'pip install trackastra'."
+        )
+
     _, pbar_init, pbar_update, pbar_close = util.handle_pbar(verbose, pbar_init=pbar_init, pbar_update=pbar_update)
 
     if gap_closing is not None and gap_closing > 0:

@@ -323,6 +323,7 @@ def get_sam_model(
     peft_kwargs: Optional[Dict] = None,
     flexible_load_checkpoint: bool = False,
     progress_bar_factory: Optional[Callable] = None,
+    decoder_path: Optional[Union[str, os.PathLike]] = None,
     **model_kwargs,
 ) -> SamPredictor:
     r"""Get the Segment Anything Predictor.
@@ -361,6 +362,10 @@ def get_sam_model(
         flexible_load_checkpoint: Whether to adjust mismatching params while loading pretrained checkpoints.
             By default, set to 'False'.
         progress_bar_factory: A function to create a progress bar for the model download.
+        decoder_path: Optional path to weights for a segmentation decoder. If given and
+            `return_state=True`, the decoder state is added to the returned state as
+            'decoder_state'. This can be used to provide decoder-only weights that are
+            separate from the encoder checkpoint.
         model_kwargs: Additional parameters necessary to initialize the Segment Anything model.
 
     Returns:
@@ -376,7 +381,9 @@ def get_sam_model(
     # URL from the model_type. If the model_type is invalid pooch will raise an error.
     _provided_checkpoint_path = checkpoint_path is not None
     if checkpoint_path is None:
-        checkpoint_path, model_hash, decoder_path = _download_sam_model(model_type, progress_bar_factory)
+        checkpoint_path, model_hash, downloaded_decoder_path = _download_sam_model(model_type, progress_bar_factory)
+        if decoder_path is None:
+            decoder_path = downloaded_decoder_path
 
     # checkpoint_path has been passed, we use it instead of downloading a model.
     else:
@@ -386,7 +393,9 @@ def get_sam_model(
         if not os.path.exists(checkpoint_path):
             raise ValueError(f"Checkpoint at '{checkpoint_path}' could not be found.")
         model_hash = _compute_hash(checkpoint_path)
-        decoder_path = None
+
+    if decoder_path is not None and not os.path.exists(decoder_path):
+        raise ValueError(f"Decoder checkpoint at '{decoder_path}' could not be found.")
 
     # Our fine-tuned model types have a suffix "_...". This suffix needs to be stripped
     # before calling sam_model_registry.
@@ -1157,7 +1166,7 @@ def precompute_image_embeddings(
             in the mask will be excluded from the computation. It does not have any effect for non-tiled embeddings.
         pbar_init: Callback to initialize an external progress bar. Must accept number of steps and description.
             Can be used together with pbar_update to handle napari progress bar in other thread.
-            To enables using this function within a threadworker.
+            To enable using this function within a threadworker.
         pbar_update: Callback to update an external progress bar.
 
     Returns:
@@ -1646,6 +1655,100 @@ def _batched_mask_nms(masks, boxes, scores, nms_thresh, intersection_over_min):
     return torch.tensor(keep)
 
 
+def _xywh_to_xyxy(boxes):
+    boxes = boxes.clone() if isinstance(boxes, torch.Tensor) else torch.tensor(boxes)
+    boxes = boxes.to(torch.float32)
+    boxes[:, 2] += boxes[:, 0]
+    boxes[:, 3] += boxes[:, 1]
+    return boxes
+
+
+def _infer_tiled_shape(predictions):
+    shape = [0, 0]
+    for pred in predictions:
+        bbox, global_bbox = pred["bbox"], pred["global_bbox"]
+        offset = (global_bbox[0] - bbox[0], global_bbox[1] - bbox[1])
+        mask_shape = pred["segmentation"].shape
+        shape[0] = max(shape[0], offset[1] + mask_shape[0])
+        shape[1] = max(shape[1], offset[0] + mask_shape[1])
+    return tuple(shape)
+
+
+def _calculate_tiled_mask_overlap_matrix(masks, boxes, global_boxes, intersection_over_min):
+    n_masks = len(masks)
+    overlap_scores = torch.zeros((n_masks, n_masks))
+    overlap_scores.fill_diagonal_(1)
+
+    boxes = (
+        boxes.detach().cpu().to(dtype=torch.long)
+        if isinstance(boxes, torch.Tensor) else torch.tensor(boxes, dtype=torch.long)
+    )
+    global_boxes = (
+        global_boxes.detach().cpu().to(dtype=torch.long)
+        if isinstance(global_boxes, torch.Tensor) else torch.tensor(global_boxes, dtype=torch.long)
+    )
+    global_boxes_xyxy = _xywh_to_xyxy(global_boxes).to(torch.long)
+    overlap_m = _overlap_matrix(global_boxes_xyxy)
+    masks = [mask.detach().cpu() if isinstance(mask, torch.Tensor) else torch.tensor(mask) for mask in masks]
+    areas = torch.tensor([mask.sum() for mask in masks], dtype=torch.float32)
+
+    for i in range(n_masks):
+        js = torch.where(overlap_m[i])[0]
+        js_half = js[js > i]
+        if len(js_half) == 0:
+            continue
+
+        offset_i = global_boxes[i, :2] - boxes[i, :2]
+        for j in js_half:
+            offset_j = global_boxes[j, :2] - boxes[j, :2]
+            overlap = [
+                max(global_boxes_xyxy[i, 0], global_boxes_xyxy[j, 0]),
+                max(global_boxes_xyxy[i, 1], global_boxes_xyxy[j, 1]),
+                min(global_boxes_xyxy[i, 2], global_boxes_xyxy[j, 2]),
+                min(global_boxes_xyxy[i, 3], global_boxes_xyxy[j, 3]),
+            ]
+
+            mask_i = masks[i][
+                overlap[1] - offset_i[1]:overlap[3] - offset_i[1],
+                overlap[0] - offset_i[0]:overlap[2] - offset_i[0],
+            ]
+            mask_j = masks[j][
+                overlap[1] - offset_j[1]:overlap[3] - offset_j[1],
+                overlap[0] - offset_j[0]:overlap[2] - offset_j[0],
+            ]
+            intersection = torch.logical_and(mask_i, mask_j).sum()
+            min_area = torch.minimum(areas[i], areas[j])
+            denominator = min_area if intersection_over_min else areas[i] + areas[j] - intersection
+            overlap_scores[i, j] = intersection / denominator
+
+    overlap_scores = overlap_scores + overlap_scores.T
+    overlap_scores.fill_diagonal_(1)
+    return overlap_scores
+
+
+def _batched_tiled_mask_nms(masks, boxes, global_boxes, scores, nms_thresh, intersection_over_min):
+    scores = (
+        scores.detach() if isinstance(scores, torch.Tensor) else torch.tensor(scores)
+    ).cpu()
+
+    iou_matrix = _calculate_tiled_mask_overlap_matrix(masks, boxes, global_boxes, intersection_over_min)
+    sorted_indices = torch.argsort(scores, descending=True)
+
+    keep = []
+    while len(sorted_indices) > 0:
+        i = sorted_indices[0]
+        keep.append(i)
+
+        if len(sorted_indices) == 1:
+            break
+
+        iou_values = iou_matrix[i, sorted_indices[1:]]
+        mask = iou_values <= nms_thresh
+        sorted_indices = sorted_indices[1:][mask]
+
+    return torch.tensor(keep)
+
+
 def mask_data_to_segmentation(
     masks: List[Dict[str, Any]],
     shape: Optional[Tuple[int, int]] = None,
@@ -1739,7 +1842,7 @@ def apply_nms(
         predictions: The mask predictions from SAM.
         min_size: The minimum mask size to keep in the output.
         shape: The shape of the output segmentation.
-            Has to be passed for predictions obtained from tiling.
+            For tiled predictions this is inferred from the tile-local mask shapes if it is not passed.
         perform_box_nms: Whether to perform NMS on the box coordinates or on the masks.
         nms_thresh: The threshold for filtering out objects in NMS.
         max_size: The maximum mask size to keep in the output.
@@ -1749,47 +1852,63 @@ def apply_nms(
     Returns:
         The segmentation obtained from merging the masks left after NMS.
     """
-    data = amg_utils.MaskData(
-        masks=torch.cat([pred["segmentation"][None] for pred in predictions], dim=0),
-        iou_preds=torch.tensor([pred["predicted_iou"] for pred in predictions]),
-    )
-    data["boxes"] = torch.tensor(np.array([pred["bbox"] for pred in predictions]))
-    data["area"] = [mask.sum() for mask in data["masks"]]
-    data["stability_scores"] = torch.tensor([pred["stability_score"] for pred in predictions])
-
     # Check if the input comes with a 'global_bbox' attribute. If it does, then the predictions are from
     # a tiled prediction. In this case, we have to take the coordinates w.r.t. the tiling into account.
-    if "global_bbox" in predictions[0]:
-        if shape is None:
-            raise ValueError("The output shape 'shape' has to be passed for tiled predictions.")
+    is_tiled = "global_bbox" in predictions[0]
+    if is_tiled and shape is None:
+        shape = _infer_tiled_shape(predictions)
+
+    masks = [pred["segmentation"] for pred in predictions]
+    nms_masks = None if is_tiled else torch.cat([mask[None] for mask in masks], dim=0)
+    data = amg_utils.MaskData(masks=masks, iou_preds=torch.tensor([pred["predicted_iou"] for pred in predictions]))
+    data["boxes"] = torch.tensor(np.array([pred["bbox"] for pred in predictions]))
+    data["area"] = [int(mask.sum()) for mask in data["masks"]]
+    data["stability_scores"] = torch.tensor([pred["stability_score"] for pred in predictions])
+    if is_tiled:
         data["global_boxes"] = torch.tensor(np.array([pred["global_bbox"] for pred in predictions]))
-        is_tiled = True
-    else:
-        is_tiled = False
 
     if min_size > 0:
         keep_by_size = torch.tensor(
             [i for i, area in enumerate(data["area"]) if area > min_size], dtype=torch.long,
         )
         data.filter(keep_by_size)
+        if nms_masks is not None:
+            nms_masks = nms_masks[keep_by_size]
 
     if max_size is not None:
         keep_by_size = torch.tensor([i for i, area in enumerate(data["area"]) if area < max_size])
         data.filter(keep_by_size)
+        if nms_masks is not None:
+            nms_masks = nms_masks[keep_by_size]
+
+    if len(data["masks"]) == 0:
+        if shape is None:
+            shape = predictions[0]["segmentation"].shape
+        return np.zeros(shape, dtype="uint32")
 
     scores = data["iou_preds"] * data["stability_scores"]
+    boxes = _xywh_to_xyxy(data["global_boxes"] if is_tiled else data["boxes"])
     if perform_box_nms:
         assert not intersection_over_min  # not implemented
         keep_by_nms = batched_nms(
-            data["global_boxes"].float() if is_tiled else data["boxes"].float(),
+            boxes,
             scores,
             torch.zeros_like(data["boxes"][:, 0]),  # categories
             iou_threshold=nms_thresh,
         )
+    elif is_tiled:
+        keep_by_nms = _batched_tiled_mask_nms(
+            masks=data["masks"],
+            boxes=data["boxes"],
+            global_boxes=data["global_boxes"],
+            scores=scores,
+            nms_thresh=nms_thresh,
+            intersection_over_min=intersection_over_min,
+        )
     else:
         keep_by_nms = _batched_mask_nms(
-            masks=data["masks"],
-            boxes=data["global_boxes"].float() if is_tiled else data["boxes"].float(),
+            masks=nms_masks,
+            boxes=boxes,
             scores=scores,
             nms_thresh=nms_thresh,
             intersection_over_min=intersection_over_min,
